@@ -1,0 +1,8 @@
+*
+!package.json
+!bun.lock
+!server/
+!server/**
+!shared/
+!shared/**
+!peer.ts

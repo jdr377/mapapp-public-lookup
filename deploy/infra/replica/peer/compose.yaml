@@ -1,0 +1,92 @@
+name: mapapp-peer-qualification
+services:
+  pg:
+    restart: unless-stopped
+    image: postgis/postgis:16-3.5@sha256:94146ac37bc61e2322f88016056c5920729cb8c64c8542ed590af8fc2abdac07
+    environment:
+      POSTGRES_DB: peer_qualification
+      POSTGRES_PASSWORD: ${PEER_FIXTURE_PG_OWNER:?}
+      PEER_FIXTURE_PG_USER_PASSWORD: ${PEER_FIXTURE_PG_USER_PASSWORD:?}
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./peer-schema.sql:/docker-entrypoint-initdb.d/21-publications.sql:ro
+      - ./peer-init.sh:/docker-entrypoint-initdb.d/22-local-role.sh:ro
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres, -d, peer_qualification]
+      interval: 3s
+      timeout: 4s
+      retries: 30
+  mysql:
+    restart: unless-stopped
+    image: mysql:8.4.13@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PEER_FIXTURE_MYSQL_OWNER:?}
+      MYSQL_DATABASE: peer_qualification
+      MYSQL_USER: peer_operator
+      MYSQL_PASSWORD: ${PEER_FIXTURE_MYSQL_PASSWORD:?}
+    volumes: [mysql:/var/lib/mysql]
+    healthcheck:
+      test: [CMD, mysqladmin, ping, -h, 127.0.0.1, --silent]
+      interval: 4s
+      timeout: 4s
+      retries: 30
+  mongo:
+    profiles: [public-peer]
+    image: mongo:8.3.4@sha256:309d760ba3f7962e14d54ac6123c7fe72ed2d465196b4d0eaf8abcea7dd39450
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: peer_admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MAPAPP_PEER_MONGO_ROOT_PASSWORD:-}
+      MAPAPP_PEER_MONGO_PASSWORD: ${MAPAPP_PEER_MONGO_PASSWORD:-}
+    volumes:
+      - mongo:/data/db
+      - ./peer-mongo-init.js:/docker-entrypoint-initdb.d/20-peer.js:ro
+    healthcheck:
+      test: [CMD, mongosh, --quiet, --eval, "db.adminCommand({ping:1}).ok"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 20
+  peer:
+    restart: unless-stopped
+    image: ${MAPAPP_PEER_IMAGE:-mapapp-recovery:local}
+    build: ./image
+    init: true
+    command: ${MAPAPP_PEER_COMMAND:-bun --no-env-file peer.ts}
+    stop_grace_period: 30s
+    environment:
+      PEER_FIXTURE_PG_USER_PASSWORD: ${PEER_FIXTURE_PG_USER_PASSWORD:?}
+      PEER_FIXTURE_MYSQL_PASSWORD: ${PEER_FIXTURE_MYSQL_PASSWORD:?}
+      PEER_FIXTURE_SERVER_KEY: ${PEER_FIXTURE_SERVER_KEY:?}
+      PEER_FIXTURE_ADMIN_TOKEN: ${PEER_FIXTURE_ADMIN_TOKEN:?}
+      MAPAPP_RECORD_SOURCE: ${MAPAPP_RECORD_SOURCE:?}
+      MAPAPP_PEER_STACK_ORIGIN: ${MAPAPP_PEER_STACK_ORIGIN:-}
+      MAPAPP_PEER_ALLOW_PRIVATE_STACK_HTTP: ${MAPAPP_PEER_ALLOW_PRIVATE_STACK_HTTP:-false}
+      MAPAPP_PEER_STACK_BUILD: ${MAPAPP_PEER_STACK_BUILD:-}
+      MAPAPP_PEER_ORIGIN: ${MAPAPP_PEER_ORIGIN:-}
+      MAPAPP_PEER_WALLET_STORAGE_URL: ${MAPAPP_PEER_WALLET_STORAGE_URL:-}
+      MAPAPP_PEER_ADVERTISE_FUNDED: ${MAPAPP_PEER_ADVERTISE_FUNDED:-false}
+      MAPAPP_PEER_MONGO_PASSWORD: ${MAPAPP_PEER_MONGO_PASSWORD:-}
+    networks: [default, link]
+    volumes:
+      - backup:/backup
+    healthcheck:
+      test: [CMD, bun, -e, "process.exit((await fetch('http://127.0.0.1:8791/health')).ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    depends_on:
+      pg: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      mongo: {condition: service_healthy, required: false}
+volumes:
+  backup:
+  pg:
+  mysql:
+  mongo:
+networks:
+  link:
+    external: true
+    name: ${MAPAPP_LINK_NETWORK:?}
+  default:
+    internal: true

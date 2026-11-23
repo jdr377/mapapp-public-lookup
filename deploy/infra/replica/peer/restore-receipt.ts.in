@@ -1,0 +1,45 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+
+const get = async (url: string) => {
+  const response = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(20000) });
+  assert(response.ok, `${url} HTTP ${response.status}`);
+  return response;
+};
+const receiver = "http://127.0.0.1:8791";
+const snapshot = await (await get(receiver + "/snapshot")).json();
+const source = await (await get(process.env.MAPAPP_RECORD_SOURCE + "/snapshot")).json();
+for (const field of ["cutoff", "verifiedDigest"]) {
+  assert.deepEqual(snapshot.receipt[field], source.receipt[field], "Source changed during restore: " + field);
+}
+assert.deepEqual(snapshot.rows, source.rows);
+// Town checks original availability on each read. An expiry between reads
+// must not invalidate the on-chain records and dependencies already verified.
+const durableDependencies = (data: typeof snapshot) => data.dependencies.filter(item => item.kind !== "media");
+const durableGaps = (data: typeof snapshot) =>
+  data.receipt.missingDependencies.filter(item => !item.id.startsWith("media:"));
+assert.deepEqual(durableDependencies(snapshot), durableDependencies(source));
+assert.deepEqual(durableGaps(snapshot), durableGaps(source));
+assert.deepEqual(snapshot.receipt.gaps, source.receipt.gaps);
+
+let verifiedOriginals = 0;
+for (const item of snapshot.dependencies.filter(item => item.kind === "media")) {
+  const response = await get(receiver + "/media/" + item.hash);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), item.hash);
+  verifiedOriginals++;
+}
+const unavailableOriginals = snapshot.receipt.missingDependencies.filter(item => item.id.startsWith("media:"));
+const otherDependencyGaps = snapshot.receipt.missingDependencies.filter(item => !item.id.startsWith("media:"));
+console.log(JSON.stringify({
+  recordParity: true,
+  peer: process.env.MAPAPP_RECORD_SOURCE,
+  cutoff: snapshot.receipt.cutoff,
+  verifiedRecords: snapshot.rows.length,
+  topicDigest: snapshot.receipt.verifiedDigest,
+  topicGaps: snapshot.receipt.gaps,
+  dependencies: snapshot.dependencies.length,
+  verifiedOriginals,
+  unavailableOriginals,
+  otherDependencyGaps,
+}, null, 2));

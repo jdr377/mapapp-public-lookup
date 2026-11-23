@@ -1,0 +1,4 @@
+services:
+  peer:
+    ports:
+      - "127.0.0.1:${MAPAPP_PEER_HOST_PORT:-18791}:8791"

@@ -1,0 +1,287 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { rename } from "node:fs/promises";
+import pg from "pg";
+import OverlayExpress from "@bsv/overlay-express";
+import { KnexStorage } from "@bsv/overlay";
+import { MerklePath, Transaction } from "@bsv/sdk";
+import { configureMapAppOverlay, MAPAPP_TOPIC } from "./server/bitcoin/overlay/mapapp";
+import { createPeerReceipts } from "./server/bitcoin/overlay/peerReceipts";
+import { createOverlayAdvertiser, startOverlayHost } from "./server/bitcoin/overlay/peerHost";
+import { createOverlayRelayFlow } from "./server/bitcoin/overlay/relayFlow";
+import { createOverlayStackProviders } from "./server/bitcoin/overlay/stackProviders";
+import { readBoundedBody } from "./server/http/requestSecurity";
+import { TRANSACTION_EVIDENCE_MAX_BYTES } from "./shared/mediaLimits";
+
+function setting(key: string) {
+  const result = process.env[`PEER_FIXTURE_${key}`];
+  if (!result || !/^[0-9a-f]+$/.test(result)) throw Error(`Invalid fixture setting ${key}`);
+  return result;
+}
+const source = process.env.MAPAPP_RECORD_SOURCE!;
+const sourceUrl = new URL(source);
+assert(["http:", "https:"].includes(sourceUrl.protocol), "Expected an HTTP(S) record source");
+assert(!sourceUrl.username && !sourceUrl.password && !sourceUrl.search && !sourceUrl.hash,
+  "Record source must not contain credentials, a query or a fragment");
+const stackOrigin = process.env.MAPAPP_PEER_STACK_ORIGIN?.trim();
+const publicOrigin = process.env.MAPAPP_PEER_ORIGIN?.trim();
+assert(!publicOrigin || stackOrigin, "A peer origin requires a live Stack");
+const liveStack = stackOrigin ? createOverlayStackProviders(stackOrigin, {
+  allowPrivateHttp: process.env.MAPAPP_PEER_ALLOW_PRIVATE_STACK_HTTP === "true",
+  requireNetworkObservation: true,
+}) : undefined;
+const stackBuild = process.env.MAPAPP_PEER_STACK_BUILD?.trim();
+assert(!liveStack || stackBuild, "Live mode requires the selected Stack build identifier");
+const relayFlow = liveStack && createOverlayRelayFlow(liveStack.broadcaster);
+const origin = publicOrigin ? new URL(publicOrigin) : new URL("https://mapapp-peer.invalid");
+assert(origin.protocol === "https:" && origin.href === origin.origin + "/", "Peer origin must be a bare HTTPS origin");
+const walletStorage = process.env.MAPAPP_PEER_WALLET_STORAGE_URL;
+if (walletStorage) {
+  const url = new URL(walletStorage);
+  assert(liveStack && publicOrigin && url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash,
+    "Fanout requires a live Stack, peer origin and HTTPS wallet storage URL");
+}
+const advertiser = createOverlayAdvertiser({
+  advertisingEnabled: Boolean(walletStorage),
+  advertisingFunded: process.env.MAPAPP_PEER_ADVERTISE_FUNDED === "true",
+  rootHex: setting("SERVER_KEY"),
+  walletStorageUrl: walletStorage ?? "",
+  advertisedOrigin: origin.origin,
+}, process.argv.slice(2));
+const roots = new Map<number,string>();
+const anchorHeaders = new Map<number,{blockHeight:number,blockHash:string,merkleRoot:string}>();
+let height=0;
+let published: string | null=await Bun.file("/backup/snapshot.json").exists()
+  ? await Bun.file("/backup/snapshot.json").text() : null;
+const digest = (ids:string[]) => createHash("sha256").update(JSON.stringify(ids.toSorted())).digest("hex");
+async function get(url:string,body?:object,headers?:Record<string,string>) {
+  const reply=await fetch(url,{redirect:"error",signal:AbortSignal.timeout(15000),
+    ...(body ? {method:"POST",headers:{"content-type":"application/json",...headers},body:JSON.stringify(body)} : {})});
+  if(!reply.ok) throw Error(new URL(url).pathname+" HTTP "+reply.status);
+  return reply.json();
+}
+function headerHash(h) {
+  const bytes=Buffer.alloc(80);
+  bytes.writeUInt32LE(h.version>>>0,0);
+  Buffer.from(h.previousHash,"hex").reverse().copy(bytes,4);
+  Buffer.from(h.merkleRoot,"hex").reverse().copy(bytes,36);
+  bytes.writeUInt32LE(h.time,68); bytes.writeUInt32LE(h.bits,72); bytes.writeUInt32LE(h.nonce,76);
+  const sha=(b)=>createHash("sha256").update(b).digest();
+  return sha(sha(bytes)).reverse().toString("hex");
+}
+const pool = new pg.Pool({ host: "pg", port: 5432, database: "peer_qualification", user: "peer_operator",
+  password: setting("PG_USER_PASSWORD"), max: 2, statement_timeout: 15000 });
+const host = new OverlayExpress("mapapp_peer_qualification", setting("SERVER_KEY"),
+  origin.origin, setting("ADMIN_TOKEN"));
+// OverlayExpress 2.7.5 calls app.listen(port, ready). Keep the raw Engine
+// socket local to this container, including when it joins a shared network.
+const listen = host.app.listen.bind(host.app);
+host.app.listen = ((port: number, ready: () => void) => listen(port, "127.0.0.1", ready)) as typeof host.app.listen;
+host.app.use((request, response, next) => {
+  if (!liveStack && request.path === "/submit") {
+    response.status(503).json({ error: "Live Stack is not configured" });
+    return;
+  }
+  next();
+});
+if (relayFlow) host.app.use(relayFlow.manualSync);
+let closing = false, broadcasts = 0;
+async function close() {
+  if (closing) return;
+  closing = true;
+  try { await host.close(); } finally { await pool.end(); }
+}
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => {
+  void close().then(() => process.exit(0), () => process.exit(1));
+});
+
+try {
+  await pool.query("SELECT txid FROM public_publications.roots LIMIT 0");
+  await host.configureKnex({ client: "mysql2", connection: { host: "mysql", database: "peer_qualification",
+    user: "peer_operator", password: setting("MYSQL_PASSWORD") }, pool: { min: 0, max: 2 } });
+  if (advertiser) {
+    const password = process.env.MAPAPP_PEER_MONGO_PASSWORD ?? "";
+    assert(/^[a-f0-9]{64}$/.test(password), "Discovery database is not configured");
+    await host.configureMongo(`mongodb://peer_operator:${password}@mongo:27017/mapapp_peer_discovery?authSource=mapapp_peer_discovery`);
+  }
+  host.configurePort(8080);
+  host.configureNetwork("main");
+  host.configureVerboseRequestLogging(false);
+  host.configureEdgePolicy({ binaryBodyLimitBytes: TRANSACTION_EVIDENCE_MAX_BYTES,
+    jsonBodyLimitBytes: 128 * 1024, maxConcurrentRequests: 16,
+    http: { requestTimeoutMs: 30000, headersTimeoutMs: 15000, keepAliveTimeoutMs: 5000,
+      socketTimeoutMs: 30000, maxRequestsPerSocket: 1000 } });
+  host.configureEnableGASPSync(true);
+  host.configureEnableBASMSync(false);
+  const receipts = createPeerReceipts(pool, 1);
+  configureMapAppOverlay(host, { receipts, storage: new KnexStorage(host.knex!), freshnessLockSats: 1 });
+  host.configureEngineParams({ chainTracker: {
+    async currentHeight() { return liveStack ? liveStack.chainTracker.currentHeight() : height; },
+    async isValidRootForHeight(root, height) {
+      return liveStack ? liveStack.chainTracker.isValidRootForHeight(root, height) : roots.get(height) === root;
+    },
+  }, syncConfiguration: { [MAPAPP_TOPIC]: false }, suppressDefaultSyncAdvertisements: true,
+  throwOnBroadcastFailure: true,
+  topicAnchorHeaderResolver: async height => anchorHeaders.get(height) ?? liveStack?.topicAnchorHeaderResolver(height),
+  advertiser: advertiser ?? {
+    async createAdvertisements() { throw Error("Fixture advertising is disabled"); },
+    async findAllAdvertisements() { throw Error("Fixture advertising is disabled"); },
+    async revokeAdvertisements() { throw Error("Fixture advertising is disabled"); },
+    parseAdvertisement() { throw Error("Fixture advertising is disabled"); },
+  },
+  broadcaster: relayFlow?.broadcaster ?? { async broadcast() { broadcasts++; throw Error("Unexpected fixture broadcast"); } } });
+  await host.configureEngine(Boolean(advertiser));
+  if (!advertiser) host.engine!.advertiser = undefined;
+  await startOverlayHost(host, advertiser);
+  const engine=host.engine!;
+  Bun.serve({hostname:"0.0.0.0",port:8791,maxRequestBodySize:TRANSACTION_EVIDENCE_MAX_BYTES,fetch(req) {
+    const path=new URL(req.url).pathname;
+    if (!liveStack && req.method === "POST" && path === "/submit")
+      return Response.json({ error: "Live Stack is not configured" }, { status: 503 });
+    // Expose protocol methods on the existing peer port so the operator can
+    // attach a private or HTTPS ingress without forwarding Engine admin routes.
+    if (liveStack && req.method === "POST" && ["/submit", "/lookup", "/requestSyncResponse", "/requestForeignGASPNode"].includes(path)) {
+      const headers = new Headers();
+      for (const key of ["content-type", "x-topics", "x-includes-off-chain-values", "x-bsv-topic"]) {
+        const value = req.headers.get(key);
+        if (value) headers.set(key, value);
+      }
+      return fetch("http://127.0.0.1:8080" + path, {
+        method: "POST", headers, body: req.body, redirect: "error",
+      }).catch(() => new Response(null, { status: 502 }));
+    }
+    if (req.method !== "GET" && req.method !== "HEAD")
+      return new Response(null, { status: 405, headers: { allow: "GET, HEAD" } });
+    if(path==="/health") return Response.json({ready:published!==null},{status:published?200:503});
+    if(path==="/snapshot"&&published) return new Response(published,{headers:{"content-type":"application/json"}});
+    if(path.startsWith("/media/")&&published){
+      const item=JSON.parse(published).dependencies.find(row=>row.id==="media:"+path.slice(7));
+      if(!item) return new Response("Not found",{status:404});
+      const bytes=Buffer.from(item.bytes,"base64");
+      const mime=bytes.subarray(8,12).toString()==="WEBP"?"image/webp":
+        bytes.subarray(0,4).toString("hex")==="1a45dfa3"?"video/webm":"application/octet-stream";
+      return new Response(bytes,{headers:{"content-type":mime,"x-content-type-options":"nosniff"}});
+    }
+    return new Response("Snapshot unavailable",{status:503});
+  }});
+  async function sync(){
+    const {receipt,rows,dependencies}=await get(source+"/snapshot");
+    assert.equal(rows.length,receipt.verified);
+    assert.equal(digest(rows.map(row=>row.id)),receipt.verifiedDigest);
+    height=receipt.cutoff.height;
+    assert.equal(dependencies.length,receipt.dependencyCount);
+    assert.equal(createHash("sha256").update(JSON.stringify(dependencies)).digest("hex"),receipt.dependencyDigest);
+    const available=new Set([...rows,...dependencies].map(row=>row.id));
+    for(const item of dependencies){
+      if(item.kind==="media"){
+        assert.equal(createHash("sha256").update(Buffer.from(item.bytes,"base64")).digest("hex"),item.hash);
+        assert.equal(item.id,"media:"+item.hash);
+      }else if(item.kind==="transaction"){
+        const [id,vout]=item.id.split(".");
+        const tx=Transaction.fromBEEF([...Buffer.from(item.beef,"base64")],id);
+        const proof=MerklePath.fromHex(item.proof);
+        assert.equal(tx.id("hex"),id);
+        assert(tx.outputs[Number(vout)]);
+        assert.equal(headerHash(item.header),item.header.hash);
+        assert.equal(proof.blockHeight,item.header.height);
+        assert(proof.blockHeight<=height);
+        assert.equal(proof.computeRoot(id),item.header.merkleRoot);
+      }else{
+        assert.equal(item.kind,"identity");
+        assert.equal(item.id,"identity:"+item.bapId);
+        const gaps=new Set(receipt.missingDependencies.map(row=>row.id));
+        assert(item.txids.every(id=>available.has(id+".0")||gaps.has(id+".0")));
+      }
+    }
+    const groups=new Map();
+    for(const row of rows){
+      const [id,index]=row.id.split(".");
+      assert(/^[0-9a-f]{64}$/.test(id)&&/^\d+$/.test(index));
+      assert.equal(headerHash(row.header),row.header.hash);
+      const tx=Transaction.fromBEEF([...Buffer.from(row.beef,"base64")],id);
+      const proof=MerklePath.fromHex(row.proof);
+      assert.equal(tx.id("hex"),id);
+      assert(tx.outputs[Number(index)]);
+      assert.equal(proof.blockHeight,row.header.height);
+      assert(proof.blockHeight<=height);
+      assert.equal(proof.computeRoot(id),row.header.merkleRoot);
+      const previous=anchorHeaders.get(proof.blockHeight);
+      if(previous) assert.equal(previous.blockHash,row.header.hash,"Reorg requires reconciliation");
+      roots.set(proof.blockHeight,row.header.merkleRoot);
+      anchorHeaders.set(proof.blockHeight,{blockHeight:proof.blockHeight,blockHash:row.header.hash,merkleRoot:row.header.merkleRoot});
+      tx.merklePath=proof;
+      if(!groups.has(id)) groups.set(id,{tx,vouts:[]});
+      groups.get(id).vouts.push(Number(index));
+    }
+    let imported=0;
+    for(const [id,{tx,vouts}] of groups){
+      const question={service:"ls_mapapp",query:{txid:id}};
+      let result=await engine.lookup(question);
+      assert.equal(result.type,"output-list");
+      if(result.outputs.length===0){
+        const admission=await engine.submit({beef:Array.from(tx.toAtomicBEEFUint8Array(true)),topics:[MAPAPP_TOPIC]},undefined,"historical-tx");
+        imported+=admission[MAPAPP_TOPIC].outputsToAdmit.length;
+        result=await engine.lookup(question);
+      } else if (liveStack && result.outputs.some(output => !Transaction.fromBEEF(output.beef, id).merklePath)) {
+        // The confirmed source can deliver a proof for a transaction already served by this peer.
+        await engine.handleNewMerkleProof(id, tx.merklePath, tx.merklePath.blockHeight);
+        result = await engine.lookup(question);
+      }
+      assert.equal(result.type,"output-list");
+      assert.deepEqual(result.outputs.map(item=>item.outputIndex).sort(),vouts.sort(),id);
+      for(const out of result.outputs) assert.equal(Transaction.fromBEEF(out.beef,id).toHex(),tx.toHex());
+    }
+    const confirmed = new Set<string>(rows.map(row => row.id));
+    const advertised=new Set<string>();
+    const liveOnly=new Set<string>();
+    let since=0;
+    for(let page=0;;page++){
+      assert(page<1000,"GASP page budget exceeded");
+      const {UTXOList}=await get("http://127.0.0.1:8080/requestSyncResponse",{version:1,since,limit:100},{"x-bsv-topic":MAPAPP_TOPIC});
+      for(const item of UTXOList) {
+        const outpoint = item.txid+"."+item.outputIndex;
+        if (liveStack && !confirmed.has(outpoint)) liveOnly.add(outpoint);
+        else advertised.add(outpoint);
+      }
+      if(UTXOList.length<100) break;
+      const next=Math.max(...UTXOList.map(item=>item.score));
+      assert(next>since,"GASP cursor stalled");
+      since=next;
+    }
+    assert.equal(digest([...advertised]),receipt.verifiedDigest,"Local GASP membership mismatch");
+    assert.equal(broadcasts,0);
+    const snapshot=JSON.stringify({receipt,rows,dependencies});
+    await Bun.write("/backup/snapshot.next",snapshot);
+    await rename("/backup/snapshot.next","/backup/snapshot.json");
+    published=snapshot;
+    console.log("MAPAPP_PEER_PARITY "+JSON.stringify({source,cutoff:receipt.cutoff,advertised:advertised.size,imported,digest:receipt.verifiedDigest,broadcasts,liveOnly:liveOnly.size}));
+  }
+  while(!closing){
+    if (liveStack && stackOrigin) {
+      try {
+        await engine.refreshUnprovenTransactionProofs({
+          topic: MAPAPP_TOPIC,
+          thresholdBlocks: 1,
+          async proofProvider(txid) {
+            const signal = AbortSignal.timeout(10000);
+            const url = new URL("/1sat/beef/" + encodeURIComponent(txid) + "/proof", stackOrigin);
+            const response = await fetch(url, { redirect: "error", signal });
+            if (response.status === 404) return undefined;
+            assert(response.ok, "Stack proof unavailable");
+            const proof = await readBoundedBody(response, 64 * 1024, signal);
+            assert(proof !== null, "Stack proof exceeds byte limit");
+            return { merklePath: MerklePath.fromBinary([...proof]) };
+          },
+        });
+      } catch (error) {
+        console.error("MAPAPP_PEER_PROOF_REFRESH_FAILED", error);
+      }
+    }
+    try{await sync();}catch(error){console.error("MAPAPP_PEER_SYNC_FAILED",error);}
+    await Bun.sleep(60000);
+  }
+} catch(error){
+  console.error(error);
+  await close();
+  process.exit(1);
+}

@@ -1,0 +1,16 @@
+{
+  "name": "mapapp-public-recovery",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@1sat/client": "0.1.1",
+    "@1sat/templates": "0.1.1",
+    "@bsv/overlay": "2.6.5",
+    "@bsv/overlay-discovery-services": "2.2.8",
+    "@bsv/overlay-express": "2.7.5",
+    "@bsv/sdk": "4.0.1",
+    "knex": "^3.3.0",
+    "mysql2": "3.24.6",
+    "pg": "^8.22.0"
+  }
+}
